@@ -5,6 +5,10 @@
 
 输入: 雷达点云 (N, 4) [x, y, z, intensity]
 输出: 标定板 3D 框 ROI ((xmin,xmax),(ymin,ymax),(zmin,zmax))
+
+用法:
+  detector = SECONDBoardDetector(model_path="path/to/best_model.pth")
+  ok, roi = detector.detect(pc)
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+# 让 second_model 可导入
 _THIS_DIR = Path(__file__).resolve().parent
 _SECOND_DIR = _THIS_DIR.parent / "models" / "second_model"
 if str(_SECOND_DIR) not in sys.path:
@@ -26,6 +31,7 @@ from rpn import RPN
 from second import SECOND, generate_anchors
 
 
+# ==================== 硬编码配置 (与训练时一致) ====================
 VOXEL_SIZE = (0.1, 0.1, 0.2)
 POINT_CLOUD_RANGE = (0.0, -5.0, -3.0, 10.0, 5.0, 2.0)
 MAX_POINTS_PER_VOXEL = 10
@@ -39,10 +45,11 @@ NUM_CLASS = 1
 ANCHOR_SIZES = [(0.55, 1.7, 1.18)]
 ANCHOR_ROTATIONS = (0.0, 1.5707963)
 SCORE_THR = 0.3
-ROI_MARGIN = 0.3
+ROI_MARGIN = 0.3  # 检测框向外扩展的 padding (m)
 
 
 def _points_to_voxels(points):
+    """硬体素化 (复制自 preprocess/voxelize.py, 保持自包含)。"""
     x_min, y_min, z_min, x_max, y_max, z_max = POINT_CLOUD_RANGE
     vx, vy, vz = VOXEL_SIZE
     mask = (
@@ -94,10 +101,13 @@ def _points_to_voxels(points):
 
 
 class SECONDBoardDetector:
+    """SECOND 标定板检测器, 输出 3D 框 ROI。"""
+
     def __init__(self, model_path: str, score_thr: float = SCORE_THR):
         self.score_thr = score_thr
         self.device = torch.device("cpu")
 
+        # 构建模型
         self.model = SECOND(
             in_channels=4,
             vfe_filters=VFE_FILTERS,
@@ -112,47 +122,93 @@ class SECONDBoardDetector:
         self.model.load_state_dict(ckpt)
         self.model.eval()
 
+        # 预生成 anchors
         self.anchors = generate_anchors(
             GRID_SIZE, VOXEL_SIZE, POINT_CLOUD_RANGE,
             ANCHOR_SIZES, ANCHOR_ROTATIONS,
-        )
+        )  # (Dy, Dx, num_rot, 7)
 
     def _decode(self, cls_pred, loc_pred):
+        """解码最高置信度的框, 返回 (cx, cy, cz, w, l, h, yaw, score)。"""
         num_rot = self.anchors.shape[2]
         Dy, Dx = cls_pred.shape[1], cls_pred.shape[2]
         loc = loc_pred.view(num_rot, 7, Dy, Dx).permute(2, 3, 0, 1).contiguous()
         scores = torch.sigmoid(cls_pred.permute(1, 2, 0).contiguous())
+
+        # ===== 调试输出 =====
+        print(f"  [DEBUG] cls_pred shape={tuple(cls_pred.shape)}, max={cls_pred.max():.3f}, min={cls_pred.min():.3f}")
+        print(f"  [DEBUG] loc_pred shape={tuple(loc_pred.shape)}, max={loc_pred.max():.3f}, min={loc_pred.min():.3f}")
+        print(f"  [DEBUG] anchors shape={tuple(self.anchors.shape)}")
+        print(f"  [DEBUG] scores max={scores.max():.3f}, min={scores.min():.3f}, >0.3 count={(scores > 0.3).sum().item()}")
 
         ax, ay, az = self.anchors[..., 0], self.anchors[..., 1], self.anchors[..., 2]
         aw, al, ah = self.anchors[..., 3], self.anchors[..., 4], self.anchors[..., 5]
         ayaw = self.anchors[..., 6]
         dx, dy, dz, dw, dl, dh, dyaw = loc.unbind(dim=-1)
 
+        print(f"  [DEBUG] dx range=[{dx.min():.3f}, {dx.max():.3f}]")
+        print(f"  [DEBUG] dy range=[{dy.min():.3f}, {dy.max():.3f}]")
+        print(f"  [DEBUG] dz range=[{dz.min():.3f}, {dz.max():.3f}]")
+        print(f"  [DEBUG] dw range=[{dw.min():.3f}, {dw.max():.3f}]")
+        print(f"  [DEBUG] dl range=[{dl.min():.3f}, {dl.max():.3f}]")
+        print(f"  [DEBUG] dh range=[{dh.min():.3f}, {dh.max():.3f}]")
+
         pred_x = ax + dx * aw
         pred_y = ay + dy * al
         pred_z = az + dz
+        # clamp 避免 exp 溢出
+        dw = torch.clamp(dw, max=4.0)
+        dl = torch.clamp(dl, max=4.0)
+        dh = torch.clamp(dh, max=4.0)
         pred_w = aw * torch.exp(dw)
         pred_l = al * torch.exp(dl)
         pred_h = ah * torch.exp(dh)
         pred_yaw = ayaw + dyaw
 
+        print(f"  [DEBUG] pred_x range=[{pred_x.min():.3f}, {pred_x.max():.3f}]")
+        print(f"  [DEBUG] pred_y range=[{pred_y.min():.3f}, {pred_y.max():.3f}]")
+        print(f"  [DEBUG] pred_z range=[{pred_z.min():.3f}, {pred_z.max():.3f}]")
+        print(f"  [DEBUG] pred_w range=[{pred_w.min():.3f}, {pred_w.max():.3f}]")
+
         boxes = torch.stack([pred_x, pred_y, pred_z, pred_w, pred_l, pred_h, pred_yaw], dim=-1)
         boxes = boxes.cpu().numpy().reshape(-1, 7)
         scores = scores.cpu().numpy().reshape(-1)
 
-        mask = scores > self.score_thr
+        # 过滤不合理的 box: 中心坐标必须在点云范围内, 尺寸不能太大
+        x_min_pc, y_min_pc, z_min_pc, x_max_pc, y_max_pc, z_max_pc = POINT_CLOUD_RANGE
+        valid_mask = (
+            (boxes[:, 0] >= x_min_pc) & (boxes[:, 0] <= x_max_pc)
+            & (boxes[:, 1] >= y_min_pc) & (boxes[:, 1] <= y_max_pc)
+            & (boxes[:, 2] >= z_min_pc) & (boxes[:, 2] <= z_max_pc)
+            & (boxes[:, 3] < 5.0) & (boxes[:, 4] < 5.0) & (boxes[:, 5] < 5.0)
+        )
+        print(f"  [DEBUG] valid box count: {valid_mask.sum()} / {len(boxes)}")
+
+        mask = (scores > self.score_thr) & valid_mask
         if mask.sum() == 0:
             return None
         boxes, scores = boxes[mask], scores[mask]
         best = np.argmax(scores)
+        print(f"  [DEBUG] best score={scores[best]:.3f}, best box={boxes[best]}")
         return boxes[best], scores[best]
 
     def detect(self, pc_xyzi: np.ndarray):
+        """检测标定板, 返回 (ok, ROI)。
+
+        Args:
+            pc_xyzi: (N, 4) [x, y, z, intensity]。
+
+        Returns:
+            ok: 是否检测到标定板。
+            ROI: ((xmin,xmax),(ymin,ymax),(zmin,zmax)) 或 None。
+        """
         if pc_xyzi.shape[0] < 100:
             return False, None
 
+        # 只取 x, y, z, intensity 4 维 (mcap 点云可能含 ring 等额外字段)
         pc_xyzi = pc_xyzi[:, :4].copy()
 
+        # 体素化
         vf, vc, np_pts = _points_to_voxels(pc_xyzi)
         if vf.shape[0] == 0:
             return False, None
@@ -173,6 +229,7 @@ class SECONDBoardDetector:
         box, score = result
         cx, cy, cz, w, l, h, yaw = box
 
+        # 从 3D 框生成 ROI (加 margin, 不做 yaw 旋转, 保守取 AABB)
         xmin = max(cx - w / 2 - ROI_MARGIN, POINT_CLOUD_RANGE[0])
         xmax = min(cx + w / 2 + ROI_MARGIN, POINT_CLOUD_RANGE[3])
         ymin = max(cy - l / 2 - ROI_MARGIN, POINT_CLOUD_RANGE[1])
