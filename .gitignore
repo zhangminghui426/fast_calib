@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# 模型权重 (太大, 不上传)
+ckpts/*.pth
+ckpts/*.pt
+
+# 数据
+data/*.mcap
+data/*.pcd
+data/*.bin
+
+# 输出
+outputs/
+tmp/
+
+# Streamlit
+.streamlit/
+
+# OS
+.DS_Store
