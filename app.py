@@ -186,13 +186,29 @@ output_dir: "{THIS_DIR / 'outputs'}"
         )
         for line in proc.stdout:
             log_text += line
-            log_box.code(log_text, language="bash")
+            # 固定高度, 带滚动条
+            log_box.code(log_text, language="bash", height=400)
         proc.wait()
+
+        output_root = THIS_DIR / "outputs"
+        result_dir = output_root / "result"
 
         if proc.returncode == 0:
             st.success("标定完成!")
+            # 自动列出结果文件
+            st.subheader("生成的产物")
+            if result_dir.exists():
+                files = list(result_dir.glob("*"))
+                if files:
+                    for f in sorted(files):
+                        st.write(f"  - `{f.name}`  ({f.stat().st_size / 1024:.1f} KB)")
+                else:
+                    st.warning(f"result 目录存在但为空: {result_dir}")
+            else:
+                st.error(f"result 目录不存在: {result_dir}")
         else:
             st.error(f"标定失败, 返回码 {proc.returncode}")
+            st.error("请查看上方日志的错误信息")
 
 with tab2:
     st.header("可视化质检")
@@ -212,8 +228,12 @@ with tab2:
         )
         for line in proc.stdout:
             log_text += line
-            log_box.code(log_text, language="bash")
+            log_box.code(log_text, language="bash", height=400)
         proc.wait()
+        if proc.returncode == 0:
+            st.success("可视化完成!")
+        else:
+            st.error(f"可视化失败, 返回码 {proc.returncode}")
 
 with tab3:
     st.header("标定结果")
@@ -435,10 +455,14 @@ with tab4:
                 )
                 for line in proc.stdout:
                     log_text += line
-                    log_box.code(log_text, language="bash")
+                    log_box.code(log_text, language="bash", height=400)
                 proc.wait()
 
                 if proc.returncode == 0:
                     st.success(f"批量检测完成! 结果已保存到: {out_dir}")
+                    # 列出输出文件
+                    files = list(Path(out_dir).glob("*.pcd"))
+                    if files:
+                        st.write(f"共生成 {len(files)} 个 pcd 文件")
                 else:
                     st.error(f"批量检测失败, 返回码 {proc.returncode}")
