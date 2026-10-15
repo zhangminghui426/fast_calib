@@ -326,21 +326,25 @@ class FastCalibLidarCamCalibrator:
             reader = make_reader(f, decoder_factories=[DecoderFactory()])
             for schema, channel, msg, ros_msg in reader.iter_decoded_messages(topics=[img_topic]):
                 t_ns = msg_stamp_ns(ros_msg, msg)
-                name = schema.name
+                name = type(ros_msg).__name__
+                # 兼容 foxglove_msgs/msg/CompressedVideo 等带前缀的消息类型
+                is_compressed_video = "CompressedVideo" in name
+                is_compressed_image = "CompressedImage" in name
+                is_image = name == "Image"
                 try:
-                    if name == "CompressedVideo":
+                    if is_compressed_video:
                         if video_dec is None:
-                            fmt = ros_msg.format
-                            video_dec = CompressedVideoDecoder(fmt, format_map)
-                        for t, img in video_dec.decode(ros_msg.data, t_ns):
+                            video_dec = CompressedVideoDecoder(ros_msg.format, format_map)
+                            logging.info(f"CompressedVideo format={ros_msg.format}")
+                        for ft, fimg in video_dec.decode(bytes(ros_msg.data), t_ns):
                             n_img += 1
-                            yield t, img
-                    elif name == "CompressedImage":
+                            yield ft, fimg
+                    elif is_compressed_image:
                         img = cv2.imdecode(np.frombuffer(bytes(ros_msg.data), np.uint8), cv2.IMREAD_COLOR)
                         if img is not None:
                             n_img += 1
                             yield t_ns, img
-                    elif name == "Image":
+                    elif is_image:
                         img = np.frombuffer(bytes(ros_msg.data), np.uint8).reshape(ros_msg.height, ros_msg.width, -1)
                         enc = (ros_msg.encoding or "").lower()
                         if img.shape[2] == 1:
@@ -363,6 +367,9 @@ class FastCalibLidarCamCalibrator:
             return
         # 先把所有图像读出来, 以雷达为基准找最近图像
         img_msgs = list(self._iter_image_frames(mcap_path, img_topic, format_map))
+        if len(img_msgs) == 0:
+            logging.error("没有读取到任何图像帧, 请检查图像话题和消息类型是否正确!")
+            return
         img_ts = np.array([t for t, _ in img_msgs])
         imgs = [img for _, img in img_msgs]
         n_pair = n_drop = 0
@@ -515,15 +522,6 @@ class FastCalibLidarCamCalibrator:
             save_T_yaml(yaml_out, T_opt, {"mean_reproj_err_px": float(mean_err)})
             logging.info(f"saved {npy_out} / {yaml_out}")
             if self.save_intermediate:
-                for fi, h3, h2 in zip(valid_frames, lidar_3d_list, img_2d_list):
-                    imgd = cv2.imread(os.path.join(cam_out_dir, "images", f"frame_{fi:04d}.jpg"))
-                    if imgd is None:
-                        continue
-                    pts_2d_proj = self.camera.project(T_opt, h3)
-                    for uv in pts_2d_proj:
-                        cv2.circle(imgd, (int(uv[0]), int(uv[1])), 5, (0, 255, 0), -1)
-                    cv2.imwrite(os.path.join(cam_out_dir, "overlays", f"frame_{fi:04d}.jpg"), imgd) if os.path.exists(os.path.join(cam_out_dir, "overlays")) else None
-                os.makedirs(os.path.join(cam_out_dir, "overlays"), exist_ok=True)
                 for fi, h3, h2 in zip(valid_frames, lidar_3d_list, img_2d_list):
                     imgd = cv2.imread(os.path.join(cam_out_dir, "images", f"frame_{fi:04d}.jpg"))
                     if imgd is None:
