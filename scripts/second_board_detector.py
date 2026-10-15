@@ -226,6 +226,14 @@ class SECONDBoardDetector:
         # 只取 x, y, z, intensity 4 维 (mcap 点云可能含 ring 等额外字段)
         pc_xyzi = pc_xyzi[:, :4].copy()
 
+        # intensity 归一化: 训练时用的是 intensity/255.0 (0~1 范围)
+        # 推理时如果 intensity 最大值 > 1.0, 说明是原始 0~255 范围, 需要除以 255
+        inten = pc_xyzi[:, 3]
+        print(f"  [INPUT] intensity range: [{inten.min():.4f}, {inten.max():.4f}], mean={inten.mean():.4f}")
+        if inten.max() > 1.5:
+            print(f"  [INPUT] intensity max > 1.5, 归一化除以 255.0 (与训练时一致)")
+            pc_xyzi[:, 3] = inten / 255.0
+
         # 体素化
         vf, vc, np_pts = _points_to_voxels(pc_xyzi)
         if vf.shape[0] == 0:
