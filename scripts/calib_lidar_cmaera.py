@@ -1,6 +1,10 @@
 """
 Fast-Calib 鱼眼/针孔通用激光相机外参标定主程序
 """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import argparse
 import logging
 import os
