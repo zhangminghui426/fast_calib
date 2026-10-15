@@ -45,7 +45,6 @@ NUM_CLASS = 1
 ANCHOR_SIZES = [(0.55, 1.7, 1.18)]
 ANCHOR_ROTATIONS = (0.0, 1.5707963)
 SCORE_THR = 0.3
-ROI_MARGIN = 0.3  # 检测框向外扩展的 padding (m)
 
 
 def _points_to_voxels(points):
@@ -255,13 +254,13 @@ class SECONDBoardDetector:
         box, score = result
         cx, cy, cz, w, l, h, yaw = box
 
-        # 从 3D 框生成 ROI (加 margin, 不做 yaw 旋转, 保守取 AABB)
-        xmin = max(cx - w / 2 - ROI_MARGIN, POINT_CLOUD_RANGE[0])
-        xmax = min(cx + w / 2 + ROI_MARGIN, POINT_CLOUD_RANGE[3])
-        ymin = max(cy - l / 2 - ROI_MARGIN, POINT_CLOUD_RANGE[1])
-        ymax = min(cy + l / 2 + ROI_MARGIN, POINT_CLOUD_RANGE[4])
-        zmin = max(cz - h / 2 - ROI_MARGIN, POINT_CLOUD_RANGE[2])
-        zmax = min(cz + h / 2 + ROI_MARGIN, POINT_CLOUD_RANGE[5])
+        # 直接用检测框的 AABB 作为 ROI, 不加 margin, 不做点云范围 clamp
+        xmin = cx - w / 2
+        xmax = cx + w / 2
+        ymin = cy - l / 2
+        ymax = cy + l / 2
+        zmin = cz - h / 2
+        zmax = cz + h / 2
 
         roi = (
             (float(xmin), float(xmax)),
