@@ -269,7 +269,7 @@ with tab4:
             )
             st.info(f"ROI 内点数: {roi_mask.sum()} / {len(pts)}")
 
-            # plotly 可视化
+            # plotly 可视化 (ROI内绿色, 外灰色)
             import plotly.graph_objects as go
             step = max(1, len(pts) // 80000)
             p_sub = pts[::step]
@@ -283,7 +283,7 @@ with tab4:
             ))
             fig.add_trace(go.Scatter3d(
                 x=p_sub[roi_sub, 0], y=p_sub[roi_sub, 1], z=p_sub[roi_sub, 2],
-                mode="markers", marker=dict(size=2, color="red", opacity=0.8),
+                mode="markers", marker=dict(size=2, color="green", opacity=0.8),
                 name="inside ROI",
             ))
             fig.update_layout(
@@ -300,7 +300,7 @@ with tab4:
             out_pcd.points = o3d.utility.Vector3dVector(pts)
             colors = np.zeros((len(pts), 3))
             colors[~roi_mask] = [0.5, 0.5, 0.5]
-            colors[roi_mask] = [1, 0, 0]
+            colors[roi_mask] = [0, 1, 0]
             out_pcd.colors = o3d.utility.Vector3dVector(colors)
             out_path = str(vis_dir / f"roi_{uploaded_pcd.name}")
             o3d.io.write_point_cloud(out_path, out_pcd)
@@ -310,15 +310,28 @@ with tab4:
         if not mcap_file:
             st.warning("请先在左侧上传 .mcap 数据文件")
         else:
-            frame_idx = st.number_input("帧号", 0, 500, 0, 1)
-            if st.button("渲染该帧"):
-                import matplotlib.pyplot as plt
-                import cv2
-                from mcap.reader import make_reader
-                from mcap_ros2.decoder import DecoderFactory
+            lidar_topic = "/lidar/rs_h32f70_2/points"
+            cam_topic = "/camera/gmsl_2/image/encoded"
 
-                lidar_topic = "/lidar/rs_h32f70_2/points"
-                cam_topic = "/camera/gmsl_2/image/encoded"
+            # 先统计总帧数
+            from mcap.reader import make_reader
+            from mcap_ros2.decoder import DecoderFactory
+            total_frames = 0
+            with open(mcap_file, "rb") as f:
+                reader = make_reader(f, decoder_factories=[DecoderFactory()])
+                for _ in reader.iter_decoded_messages(topics=[lidar_topic]):
+                    total_frames += 1
+            st.info(f"mcap 共 {total_frames} 帧点云")
+
+            # 单帧可视化
+            st.subheader("单帧可视化")
+            frame_idx = st.number_input("帧号", 0, max(total_frames - 1, 0), 0, 1)
+            if st.button("渲染该帧"):
+                import cv2
+                import open3d as o3d
+                import plotly.graph_objects as go
+                sys.path.insert(0, str(SCRIPTS_DIR))
+                from second_board_detector import SECONDBoardDetector
 
                 # 读指定帧的点云
                 pts = None
@@ -331,89 +344,121 @@ with tab4:
                             pts = np.frombuffer(ros_msg.data, dtype=np.float32).reshape(-1, ros_msg.point_step // 4)
                             break
 
-                    if pts is None:
-                        st.error(f"帧 {frame_idx} 超出范围")
-                    else:
-                        import open3d as o3d
-                        import cv2
+                if pts is None:
+                    st.error(f"帧 {frame_idx} 超出范围")
+                else:
+                    valid_mask = np.isfinite(pts[:, :3]).all(axis=1)
+                    pts = pts[valid_mask]
+                    st.info(f"有效点云: {len(pts)} pts")
 
-                        # 过滤无效点
+                    # 运行 SECOND 检测器
+                    model_path = str("/tmp/best_model.pth")
+                    detector = SECONDBoardDetector(model_path=model_path, score_thr=second_score_thr)
+                    ok, roi = detector.detect(pts)
+
+                    if ok and roi is not None:
+                        (xmin, xmax), (ymin, ymax), (zmin, zmax) = roi
+                        st.success(f"SECOND 检测成功: x=[{xmin:.2f},{xmax:.2f}] y=[{ymin:.2f},{ymax:.2f}] z=[{zmin:.2f},{zmax:.2f}]")
+                    else:
+                        st.warning("SECOND 检测失败, 使用手动 ROI")
+                        xmin, xmax = x_min, x_max
+                        ymin, ymax = y_min, y_max
+                        zmin, zmax = z_min, z_max
+
+                    roi_mask = (
+                        (pts[:, 0] >= xmin) & (pts[:, 0] <= xmax)
+                        & (pts[:, 1] >= ymin) & (pts[:, 1] <= ymax)
+                        & (pts[:, 2] >= zmin) & (pts[:, 2] <= zmax)
+                    )
+
+                    # plotly 可视化 (ROI内绿色)
+                    step = max(1, len(pts) // 80000)
+                    p_sub = pts[::step]
+                    roi_sub = roi_mask[::step]
+
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter3d(
+                        x=p_sub[~roi_sub, 0], y=p_sub[~roi_sub, 1], z=p_sub[~roi_sub, 2],
+                        mode="markers", marker=dict(size=1, color="gray", opacity=0.3),
+                        name="outside ROI",
+                    ))
+                    fig.add_trace(go.Scatter3d(
+                        x=p_sub[roi_sub, 0], y=p_sub[roi_sub, 1], z=p_sub[roi_sub, 2],
+                        mode="markers", marker=dict(size=2, color="green", opacity=0.8),
+                        name="inside ROI",
+                    ))
+                    fig.update_layout(
+                        title=f"Frame {frame_idx}: {len(pts)} pts, ROI={roi_mask.sum()} pts",
+                        scene=dict(aspectmode="data", xaxis_title="X", yaxis_title="Y", zaxis_title="Z"),
+                        width=1000, height=600,
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    # 保存带颜色 pcd
+                    vis_dir = THIS_DIR / "outputs" / "vis"
+                    vis_dir.mkdir(parents=True, exist_ok=True)
+                    pcd = o3d.geometry.PointCloud()
+                    pcd.points = o3d.utility.Vector3dVector(pts[:, :3])
+                    colors = np.zeros((len(pts), 3))
+                    colors[~roi_mask] = [0.5, 0.5, 0.5]
+                    colors[roi_mask] = [0, 1, 0]
+                    pcd.colors = o3d.utility.Vector3dVector(colors)
+                    pcd_path = str(vis_dir / f"frame_{frame_idx:04d}.pcd")
+                    o3d.io.write_point_cloud(pcd_path, pcd)
+                    st.info(f"已保存: {pcd_path}")
+
+            # 批量检测所有帧
+            st.subheader("批量检测所有帧")
+            if st.button("运行 SECOND 检测全部帧"):
+                import open3d as o3d
+                sys.path.insert(0, str(SCRIPTS_DIR))
+                from second_board_detector import SECONDBoardDetector
+
+                model_path = str("/tmp/best_model.pth")
+                detector = SECONDBoardDetector(model_path=model_path, score_thr=second_score_thr)
+
+                vis_dir = THIS_DIR / "outputs" / "vis"
+                vis_dir.mkdir(parents=True, exist_ok=True)
+
+                ok_count = 0
+                fail_count = 0
+                progress_bar = st.progress(0)
+                log_text = ""
+
+                with open(mcap_file, "rb") as f:
+                    reader = make_reader(f, decoder_factories=[DecoderFactory()])
+                    for i, (schema, channel, msg, ros_msg) in enumerate(
+                        reader.iter_decoded_messages(topics=[lidar_topic])
+                    ):
+                        pts = np.frombuffer(ros_msg.data, dtype=np.float32).reshape(-1, ros_msg.point_step // 4)
                         valid_mask = np.isfinite(pts[:, :3]).all(axis=1)
                         pts = pts[valid_mask]
-                        st.info(f"有效点云: {len(pts)} pts")
 
-                        # 运行 SECOND 检测器
-                        sys.path.insert(0, str(SCRIPTS_DIR))
-                        from second_board_detector import SECONDBoardDetector
-
-                        model_path = str("/tmp/best_model.pth")
-                        detector = SECONDBoardDetector(model_path=model_path, score_thr=second_score_thr)
                         ok, roi = detector.detect(pts)
-
                         if ok and roi is not None:
                             (xmin, xmax), (ymin, ymax), (zmin, zmax) = roi
-                            st.success(f"SECOND 检测成功: x=[{xmin:.2f},{xmax:.2f}] y=[{ymin:.2f},{ymax:.2f}] z=[{zmin:.2f},{zmax:.2f}]")
+                            ok_count += 1
+                            log_text += f"frame {i}: OK  ROI=[{xmin:.2f},{xmax:.2f}] [{ymin:.2f},{ymax:.2f}] [{zmin:.2f},{zmax:.2f}]\n"
+
+                            # 保存带颜色 pcd
+                            roi_mask = (
+                                (pts[:, 0] >= xmin) & (pts[:, 0] <= xmax)
+                                & (pts[:, 1] >= ymin) & (pts[:, 1] <= ymax)
+                                & (pts[:, 2] >= zmin) & (pts[:, 2] <= zmax)
+                            )
+                            pcd = o3d.geometry.PointCloud()
+                            pcd.points = o3d.utility.Vector3dVector(pts[:, :3])
+                            colors = np.zeros((len(pts), 3))
+                            colors[~roi_mask] = [0.5, 0.5, 0.5]
+                            colors[roi_mask] = [0, 1, 0]
+                            pcd.colors = o3d.utility.Vector3dVector(colors)
+                            o3d.io.write_point_cloud(str(vis_dir / f"batch_frame_{i:04d}.pcd"), pcd)
                         else:
-                            st.warning("SECOND 检测失败, 使用手动 ROI")
-                            xmin, xmax = x_min, x_max
-                            ymin, ymax = y_min, y_max
-                            zmin, zmax = z_min, z_max
+                            fail_count += 1
+                            log_text += f"frame {i}: FAIL\n"
 
-                        # 构建 open3d 点云
-                        pcd = o3d.geometry.PointCloud()
-                        pcd.points = o3d.utility.Vector3dVector(pts[:, :3])
-                        colors = np.zeros((len(pts), 3))
-                        roi_mask = (
-                            (pts[:, 0] >= xmin) & (pts[:, 0] <= xmax)
-                            & (pts[:, 1] >= ymin) & (pts[:, 1] <= ymax)
-                            & (pts[:, 2] >= zmin) & (pts[:, 2] <= zmax)
-                        )
-                        colors[~roi_mask] = [0.5, 0.5, 0.5]
-                        colors[roi_mask] = [1, 0, 0]
-                        pcd.colors = o3d.utility.Vector3dVector(colors)
+                        progress_bar.progress((i + 1) / total_frames)
 
-                        # 保存 pcd, 用户可用 open3d_pcd.py 打开
-                        vis_dir = THIS_DIR / "outputs" / "vis"
-                        vis_dir.mkdir(parents=True, exist_ok=True)
-                        pcd_path = str(vis_dir / f"frame_{frame_idx:04d}.pcd")
-                        o3d.io.write_point_cloud(pcd_path, pcd)
-                        st.info(f"已保存: {pcd_path}, 终端运行 `python tools/open3d_pcd.py {pcd_path}` 打开GUI窗口")
-
-                        # plotly 交互式 3D (浏览器可旋转)
-                        import plotly.graph_objects as go
-                        step = max(1, len(pts) // 80000)
-                        p_sub = pts[::step]
-                        roi_sub = roi_mask[::step]
-
-                        fig = go.Figure()
-                        fig.add_trace(go.Scatter3d(
-                            x=p_sub[~roi_sub, 0], y=p_sub[~roi_sub, 1], z=p_sub[~roi_sub, 2],
-                            mode="markers", marker=dict(size=1, color="gray", opacity=0.3),
-                            name="outside ROI",
-                        ))
-                        fig.add_trace(go.Scatter3d(
-                            x=p_sub[roi_sub, 0], y=p_sub[roi_sub, 1], z=p_sub[roi_sub, 2],
-                            mode="markers", marker=dict(size=2, color="red", opacity=0.8),
-                            name="inside ROI",
-                        ))
-                        fig.update_layout(
-                            title=f"Frame {frame_idx}: {len(pts)} pts, ROI={roi_mask.sum()} pts",
-                            scene=dict(aspectmode="data", xaxis_title="X", yaxis_title="Y", zaxis_title="Z"),
-                            width=1000, height=600,
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-
-                        # 读对应图像
-                        img = None
-                        with open(mcap_file, "rb") as f:
-                            reader = make_reader(f, decoder_factories=[DecoderFactory()])
-                            for i, (schema, channel, msg, ros_msg) in enumerate(
-                                reader.iter_decoded_messages(topics=[cam_topic])
-                            ):
-                                if i == frame_idx:
-                                    img_arr = np.frombuffer(ros_msg.data, dtype=np.uint8)
-                                    img = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
-                                    break
-                        if img is not None:
-                            st.image(img, channels="BGR", caption=f"相机帧 {frame_idx}")
-                            cv2.imwrite(str(vis_dir / f"frame_{frame_idx:04d}_img.jpg"), img)
+                st.success(f"检测完成: 成功 {ok_count} 帧, 失败 {fail_count} 帧")
+                st.code(log_text, language="bash")
+                st.info(f"带颜色 pcd 已保存到: {vis_dir}")
