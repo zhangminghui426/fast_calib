@@ -116,7 +116,7 @@ hole_palette:
 
 point_field_datatype_to_np:
   1: "i1"
-  2: "u2"
+  2: "u1"
   3: "i2"
   4: "u2"
   5: "i4"
@@ -332,8 +332,15 @@ with tab4:
                 import plotly.graph_objects as go
                 sys.path.insert(0, str(SCRIPTS_DIR))
                 from second_board_detector import SECONDBoardDetector
+                from utils import pointcloud2_to_xyzi
 
-                # 读指定帧的点云
+                # datatype 映射
+                dtype_map = {
+                    1: "i1", 2: "u1", 3: "i2", 4: "u2",
+                    5: "i4", 6: "u4", 7: "f4", 8: "f8",
+                }
+
+                # 读指定帧的点云 (按字段 offset 正确解析)
                 pts = None
                 with open(mcap_file, "rb") as f:
                     reader = make_reader(f, decoder_factories=[DecoderFactory()])
@@ -341,14 +348,12 @@ with tab4:
                         reader.iter_decoded_messages(topics=[lidar_topic])
                     ):
                         if i == frame_idx:
-                            pts = np.frombuffer(ros_msg.data, dtype=np.float32).reshape(-1, ros_msg.point_step // 4)
+                            pts = pointcloud2_to_xyzi(ros_msg, dtype_map)
                             break
 
                 if pts is None:
                     st.error(f"帧 {frame_idx} 超出范围")
                 else:
-                    valid_mask = np.isfinite(pts[:, :3]).all(axis=1)
-                    pts = pts[valid_mask]
                     st.info(f"有效点云: {len(pts)} pts")
 
                     # 运行 SECOND 检测器

@@ -28,7 +28,14 @@ def main():
     from mcap.reader import make_reader
     from mcap_ros2.decoder import DecoderFactory
     from second_board_detector import SECONDBoardDetector
+    from utils import pointcloud2_to_xyzi
     import open3d as o3d
+
+    # datatype 映射 (与 config.yaml 中 point_field_datatype_to_np 一致)
+    dtype_map = {
+        1: "i1", 2: "u1", 3: "i2", 4: "u2",
+        5: "i4", 6: "u4", 7: "f4", 8: "f8",
+    }
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -48,9 +55,9 @@ def main():
             reader.iter_decoded_messages(topics=[args.lidar_topic])
         ):
             total += 1
-            pts = np.frombuffer(ros_msg.data, dtype=np.float32).reshape(-1, ros_msg.point_step // 4)
-            valid_mask = np.isfinite(pts[:, :3]).all(axis=1)
-            pts = pts[valid_mask]
+            # 按字段 offset 正确解析 (与标定主程序一致)
+            pts = pointcloud2_to_xyzi(ros_msg, dtype_map)
+            print(f"  frame {i}: 原始点云 {len(pts)} pts (含 ring)")
 
             ok, roi = detector.detect(pts)
             if ok and roi is not None:
