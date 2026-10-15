@@ -119,6 +119,24 @@ class SECONDBoardDetector:
         ).to(self.device)
 
         ckpt = torch.load(model_path, map_location=self.device, weights_only=True)
+
+        # ===== 权重调试 =====
+        print(f"  [WEIGHT] ckpt keys count: {len(ckpt)}")
+        print(f"  [WEIGHT] model state_dict keys count: {len(self.model.state_dict())}")
+        ckpt_keys = set(ckpt.keys())
+        model_keys = set(self.model.state_dict().keys())
+        missing = model_keys - ckpt_keys
+        unexpected = ckpt_keys - model_keys
+        print(f"  [WEIGHT] missing keys: {len(missing)}, unexpected keys: {len(unexpected)}")
+        if len(missing) > 0:
+            print(f"  [WEIGHT] sample missing: {list(missing)[:3]}")
+        if len(unexpected) > 0:
+            print(f"  [WEIGHT] sample unexpected: {list(unexpected)[:3]}")
+
+        # 检查权重统计
+        all_vals = torch.cat([v.flatten() for v in ckpt.values() if v.numel() > 0])
+        print(f"  [WEIGHT] overall mean={all_vals.mean():.4f}, std={all_vals.std():.4f}, max={all_vals.max():.4f}, min={all_vals.min():.4f}")
+
         self.model.load_state_dict(ckpt)
         self.model.eval()
 
