@@ -20,9 +20,9 @@ import numpy as np
 import torch
 import yaml
 
-# 让 second_model 可导入
+# 让 second 模型可导入
 _THIS_DIR = Path(__file__).resolve().parent
-_SECOND_DIR = _THIS_DIR.parent / "models" / "second_model"
+_SECOND_DIR = _THIS_DIR.parent / "3rdparty" / "second"
 if str(_SECOND_DIR) not in sys.path:
     sys.path.insert(0, str(_SECOND_DIR))
 
