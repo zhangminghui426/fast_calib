@@ -36,10 +36,10 @@ class ROIBoardDetector(CalibrationBoardDetector):
 import torch
 import yaml
 
-from vfe import VoxelFeatureEncoder
-from backbone import SpMiddleFPN
-from rpn import RPN
-from second import SECOND, generate_anchors
+from models.vfe import VoxelFeatureEncoder
+from models.backbone import SpMiddleFPN
+from models.rpn import RPN
+from models.second import SECOND, generate_anchors
 
 
 def _points_to_voxels(points, voxel_size, point_cloud_range, max_points_per_voxel, max_num_voxels):
