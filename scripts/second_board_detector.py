@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import yaml
 
 # 让 second_model 可导入
 _THIS_DIR = Path(__file__).resolve().parent
@@ -31,26 +32,10 @@ from rpn import RPN
 from second import SECOND, generate_anchors
 
 
-# ==================== 硬编码配置 (与训练时一致) ====================
-VOXEL_SIZE = (0.1, 0.1, 0.2)
-POINT_CLOUD_RANGE = (0.0, -5.0, -3.0, 10.0, 5.0, 2.0)
-MAX_POINTS_PER_VOXEL = 10
-MAX_NUM_VOXELS = 12000
-GRID_SIZE = (100, 100, 25)
-VFE_FILTERS = (32, 128)
-SPARSE_FILTERS = (64, 128, 256)
-UPSAMPLE_FILTERS = (128, 128, 128)
-NUM_ANCHOR_PER_LOC = 2
-NUM_CLASS = 1
-ANCHOR_SIZES = [(0.55, 1.7, 1.18)]
-ANCHOR_ROTATIONS = (0.0, 1.5707963)
-SCORE_THR = 0.3
-
-
-def _points_to_voxels(points):
-    """硬体素化 (复制自 preprocess/voxelize.py, 保持自包含)。"""
-    x_min, y_min, z_min, x_max, y_max, z_max = POINT_CLOUD_RANGE
-    vx, vy, vz = VOXEL_SIZE
+def _points_to_voxels(points, voxel_size, point_cloud_range, max_points_per_voxel, max_num_voxels):
+    """硬体素化。"""
+    x_min, y_min, z_min, x_max, y_max, z_max = point_cloud_range
+    vx, vy, vz = voxel_size
     mask = (
         (points[:, 0] >= x_min) & (points[:, 0] < x_max)
         & (points[:, 1] >= y_min) & (points[:, 1] < y_max)
@@ -61,7 +46,7 @@ def _points_to_voxels(points):
         M = 0
         C = points.shape[1]
         return (
-            np.zeros((M, MAX_POINTS_PER_VOXEL, C), dtype=np.float32),
+            np.zeros((M, max_points_per_voxel, C), dtype=np.float32),
             np.zeros((M, 3), dtype=np.int32),
             np.zeros((M,), dtype=np.int32),
         )
@@ -80,41 +65,74 @@ def _points_to_voxels(points):
     ends = np.concatenate([split_idx, [len(sorted_keys)]])
     num_voxels = len(starts)
     C = pts.shape[1]
-    voxel_features = np.zeros((num_voxels, MAX_POINTS_PER_VOXEL, C), dtype=np.float32)
+    voxel_features = np.zeros((num_voxels, max_points_per_voxel, C), dtype=np.float32)
     voxel_coords = np.zeros((num_voxels, 3), dtype=np.int32)
     num_points = np.zeros((num_voxels,), dtype=np.int32)
     for i in range(num_voxels):
         s, e = starts[i], ends[i]
-        n = min(e - s, MAX_POINTS_PER_VOXEL)
+        n = min(e - s, max_points_per_voxel)
         voxel_features[i, :n] = sorted_pts[s : s + n]
         num_points[i] = n
         p0 = sorted_pts[s]
         voxel_coords[i, 0] = int(np.floor((p0[0] - x_min) / vx))
         voxel_coords[i, 1] = int(np.floor((p0[1] - y_min) / vy))
         voxel_coords[i, 2] = int(np.floor((p0[2] - z_min) / vz))
-    if num_voxels > MAX_NUM_VOXELS:
-        voxel_features = voxel_features[:MAX_NUM_VOXELS]
-        voxel_coords = voxel_coords[:MAX_NUM_VOXELS]
-        num_points = num_points[:MAX_NUM_VOXELS]
+    if num_voxels > max_num_voxels:
+        voxel_features = voxel_features[:max_num_voxels]
+        voxel_coords = voxel_coords[:max_num_voxels]
+        num_points = num_points[:max_num_voxels]
     return voxel_features, voxel_coords, num_points
+
+
+def _load_config(model_path: str):
+    """加载模型配置: 优先用权重旁边同名 yaml, 否则用项目默认配置。"""
+    model_path = Path(model_path)
+    sidecar_yaml = model_path.with_suffix(".yaml")
+    default_yaml = _THIS_DIR.parent / "config" / "second_config.yaml"
+
+    if sidecar_yaml.exists():
+        cfg_path = sidecar_yaml
+        print(f"  [CONFIG] 使用权重旁边配置: {sidecar_yaml}")
+    else:
+        cfg_path = default_yaml
+        print(f"  [CONFIG] 使用默认配置: {default_yaml}")
+
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    return cfg
 
 
 class SECONDBoardDetector:
     """SECOND 标定板检测器, 输出 3D 框 ROI。"""
 
-    def __init__(self, model_path: str, score_thr: float = SCORE_THR):
-        self.score_thr = score_thr
+    def __init__(self, model_path: str, score_thr: float = None):
         self.device = torch.device("cpu")
+
+        # 加载配置
+        cfg = _load_config(model_path)
+        self.voxel_size = tuple(cfg["voxel_size"])
+        self.point_cloud_range = tuple(cfg["point_cloud_range"])
+        self.max_points_per_voxel = cfg["max_points_per_voxel"]
+        self.max_num_voxels = cfg["max_num_voxels"]
+        self.grid_size = tuple(cfg["grid_size"])
+        self.vfe_filters = tuple(cfg["vfe_filters"])
+        self.sparse_filters = tuple(cfg["sparse_filters"])
+        self.upsample_filters = tuple(cfg["upsample_filters"])
+        self.num_anchor_per_loc = cfg["num_anchor_per_loc"]
+        self.num_class = cfg["num_class"]
+        self.anchor_sizes = [tuple(s) for s in cfg["anchor_sizes"]]
+        self.anchor_rotations = tuple(cfg["anchor_rotations"])
+        self.score_thr = score_thr if score_thr is not None else cfg["score_thr"]
 
         # 构建模型
         self.model = SECOND(
             in_channels=4,
-            vfe_filters=VFE_FILTERS,
-            sparse_filters=SPARSE_FILTERS,
-            upsample_filters=UPSAMPLE_FILTERS,
-            grid_size=GRID_SIZE,
-            num_anchor_per_loc=NUM_ANCHOR_PER_LOC,
-            num_class=NUM_CLASS,
+            vfe_filters=self.vfe_filters,
+            sparse_filters=self.sparse_filters,
+            upsample_filters=self.upsample_filters,
+            grid_size=self.grid_size,
+            num_anchor_per_loc=self.num_anchor_per_loc,
+            num_class=self.num_class,
         ).to(self.device)
 
         ckpt = torch.load(model_path, map_location=self.device, weights_only=True)
@@ -141,8 +159,8 @@ class SECONDBoardDetector:
 
         # 预生成 anchors
         self.anchors = generate_anchors(
-            GRID_SIZE, VOXEL_SIZE, POINT_CLOUD_RANGE,
-            ANCHOR_SIZES, ANCHOR_ROTATIONS,
+            self.grid_size, self.voxel_size, self.point_cloud_range,
+            self.anchor_sizes, self.anchor_rotations,
         )  # (Dy, Dx, num_rot, 7)
 
     def _decode(self, cls_pred, loc_pred):
@@ -192,7 +210,7 @@ class SECONDBoardDetector:
         scores = scores.cpu().numpy().reshape(-1)
 
         # 过滤不合理的 box: 中心坐标必须在点云范围内, 尺寸不能太大
-        x_min_pc, y_min_pc, z_min_pc, x_max_pc, y_max_pc, z_max_pc = POINT_CLOUD_RANGE
+        x_min_pc, y_min_pc, z_min_pc, x_max_pc, y_max_pc, z_max_pc = self.point_cloud_range
         valid_mask = (
             (boxes[:, 0] >= x_min_pc) & (boxes[:, 0] <= x_max_pc)
             & (boxes[:, 1] >= y_min_pc) & (boxes[:, 1] <= y_max_pc)
@@ -234,7 +252,13 @@ class SECONDBoardDetector:
             pc_xyzi[:, 3] = inten / 255.0
 
         # 体素化
-        vf, vc, np_pts = _points_to_voxels(pc_xyzi)
+        vf, vc, np_pts = _points_to_voxels(
+            pc_xyzi,
+            voxel_size=self.voxel_size,
+            point_cloud_range=self.point_cloud_range,
+            max_points_per_voxel=self.max_points_per_voxel,
+            max_num_voxels=self.max_num_voxels,
+        )
         if vf.shape[0] == 0:
             return False, None
 
@@ -244,7 +268,7 @@ class SECONDBoardDetector:
 
         with torch.no_grad():
             cls_pred, loc_pred = self.model(
-                vf_t, vc_t, np_t, VOXEL_SIZE, POINT_CLOUD_RANGE,
+                vf_t, vc_t, np_t, self.voxel_size, self.point_cloud_range,
             )
 
         result = self._decode(cls_pred[0], loc_pred[0])
