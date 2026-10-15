@@ -22,6 +22,16 @@ TMP_DIR.mkdir(parents=True, exist_ok=True)
 st.set_page_config(page_title="Fast-Calib 标定", layout="wide")
 st.title("Fast-Calib 雷达-相机外参标定")
 
+# 全局终端日志 (所有操作的日志都输出到这里)
+if "terminal_log" not in st.session_state:
+    st.session_state["terminal_log"] = ""
+
+def log_to_terminal(msg: str):
+    """向全局终端追加一行日志"""
+    st.session_state["terminal_log"] += msg
+    if not msg.endswith("\n"):
+        st.session_state["terminal_log"] += "\n"
+
 # ==================== 侧边栏 ====================
 with st.sidebar:
     st.header("配置")
@@ -34,7 +44,7 @@ with st.sidebar:
         with open(mcap_path, "wb") as f:
             f.write(uploaded_mcap.getbuffer())
         st.session_state["mcap_file"] = str(mcap_path)
-        st.success(f"已保存: {mcap_path}")
+        log_to_terminal(f"[上传] mcap 已保存: {mcap_path}")
 
     # 2. 相机内参
     st.subheader("2. 相机内参")
@@ -46,7 +56,7 @@ with st.sidebar:
         with open(cam_path, "w", encoding="utf-8") as f:
             f.write(cam_content)
         st.text_area("内参内容", cam_content, height=150)
-        st.success(f"已保存: {cam_path}")
+        log_to_terminal(f"[上传] 内参已保存: {cam_path}")
 
     # 3. 检测器
     st.subheader("3. 检测器")
@@ -81,6 +91,11 @@ with st.sidebar:
     n_frames = st.number_input("最大标定帧数", 3, 200, 50, 1)
     min_sample = st.number_input("最小样本数", 3, 20, 6, 1)
 
+    # 终端日志 (所有操作的日志都显示在这里)
+    st.subheader("终端日志")
+    terminal_box = st.empty()
+    terminal_box.code(st.session_state["terminal_log"], language="bash", height=300)
+
 # ==================== 主界面 ====================
 tab1, tab2, tab3, tab4 = st.tabs(["标定运行", "可视化质检", "结果输出", "3D点云预览"])
 
@@ -93,6 +108,7 @@ with tab1:
         st.markdown(f"**数据**: `{mcap_file}`  |  **检测器**: {detector_type}")
 
     if st.button("开始标定", type="primary", disabled=not mcap_file):
+        log_to_terminal("\n[标定] 开始标定...")
         second_model = str("/tmp/best_model.pth")
         roi = f"[[{x_min}, {x_max}], [{y_min}, {y_max}], [{z_min}, {z_max}]]"
         cfg_text = f"""calib_board:
@@ -187,6 +203,8 @@ output_dir: "{THIS_DIR / 'outputs'}"
         )
         for line in proc.stdout:
             log_text += line
+            # 同时输出到全局终端
+            log_to_terminal(line.rstrip())
             # 固定高度, 带滚动条
             log_box.code(log_text, language="bash", height=400)
         proc.wait()
@@ -196,6 +214,7 @@ output_dir: "{THIS_DIR / 'outputs'}"
 
         if proc.returncode == 0:
             status_box.success(f"标定完成! (返回码 {proc.returncode})")
+            log_to_terminal("[标定] 标定完成!")
             # 自动列出结果文件
             st.subheader("生成的产物")
             if result_dir.exists():
@@ -203,13 +222,17 @@ output_dir: "{THIS_DIR / 'outputs'}"
                 if files:
                     for f in sorted(files):
                         st.write(f"  - `{f.name}`  ({f.stat().st_size / 1024:.1f} KB)")
+                        log_to_terminal(f"[产物] {f.name} ({f.stat().st_size / 1024:.1f} KB)")
                 else:
                     status_box.warning(f"result 目录存在但为空，可能有效样本数不足")
+                    log_to_terminal("[标定] 警告: result 目录为空，可能有效样本数不足")
             else:
                 status_box.error(f"result 目录不存在: {result_dir}")
+                log_to_terminal(f"[标定] 错误: result 目录不存在: {result_dir}")
         else:
             status_box.error(f"标定失败, 返回码 {proc.returncode}")
             st.error("请查看上方日志的错误信息")
+            log_to_terminal(f"[标定] 失败, 返回码 {proc.returncode}")
 
 with tab2:
     st.header("可视化质检")
@@ -218,6 +241,7 @@ with tab2:
     default_T = str(result_dir / "cam_gmsl_2_lidar2cam_fastcalib.npy")
     vis_T = st.text_input("外参文件路径", value=default_T)
     if st.button("运行投影可视化"):
+        log_to_terminal(f"\n[可视化] 开始投影可视化 frame={vis_frame}")
         log_box = st.empty()
         log_text = ""
         status_box = st.empty()
@@ -231,12 +255,15 @@ with tab2:
         )
         for line in proc.stdout:
             log_text += line
+            log_to_terminal(line.rstrip())
             log_box.code(log_text, language="bash", height=400)
         proc.wait()
         if proc.returncode == 0:
             status_box.success("可视化完成!")
+            log_to_terminal("[可视化] 完成")
         else:
             status_box.error(f"可视化失败, 返回码 {proc.returncode}")
+            log_to_terminal(f"[可视化] 失败, 返回码 {proc.returncode}")
 
 with tab3:
     st.header("标定结果")
@@ -264,11 +291,13 @@ with tab4:
             with open(pcd_path, "wb") as f:
                 f.write(uploaded_pcd.getbuffer())
             st.success(f"已保存: {pcd_path}")
+            log_to_terminal(f"[上传] pcd 已保存: {pcd_path}")
 
             import open3d as o3d
             pcd = o3d.io.read_point_cloud(str(pcd_path))
             pts = np.asarray(pcd.points)
             st.info(f"点云点数: {len(pts)}, 有颜色: {pcd.has_colors()}")
+            log_to_terminal(f"[点云] {uploaded_pcd.name}: {len(pts)} pts")
 
             # 手动 ROI 框选
             st.subheader("ROI 框选")
@@ -345,11 +374,13 @@ with tab4:
                 for _ in reader.iter_decoded_messages(topics=[lidar_topic]):
                     total_frames += 1
             st.info(f"mcap 共 {total_frames} 帧点云")
+            log_to_terminal(f"[mcap] {total_frames} 帧点云")
 
             # 单帧可视化
             st.subheader("单帧可视化")
             frame_idx = st.number_input("帧号", 0, max(total_frames - 1, 0), 0, 1)
             if st.button("渲染该帧"):
+                log_to_terminal(f"[渲染] 渲染 frame {frame_idx}")
                 import cv2
                 import open3d as o3d
                 import plotly.graph_objects as go
@@ -378,6 +409,7 @@ with tab4:
                     st.error(f"帧 {frame_idx} 超出范围")
                 else:
                     st.info(f"有效点云: {len(pts)} pts")
+                    log_to_terminal(f"[渲染] frame {frame_idx}: {len(pts)} pts")
 
                     # 运行 SECOND 检测器
                     model_path = str("/tmp/best_model.pth")
@@ -387,8 +419,10 @@ with tab4:
                     if ok and roi is not None:
                         (xmin, xmax), (ymin, ymax), (zmin, zmax) = roi
                         st.success(f"SECOND 检测成功: x=[{xmin:.2f},{xmax:.2f}] y=[{ymin:.2f},{ymax:.2f}] z=[{zmin:.2f},{zmax:.2f}]")
+                        log_to_terminal(f"[渲染] SECOND 检测成功")
                     else:
                         st.warning("SECOND 检测失败, 使用手动 ROI")
+                        log_to_terminal(f"[渲染] SECOND 检测失败, 使用手动 ROI")
                         xmin, xmax = x_min, x_max
                         ymin, ymax = y_min, y_max
                         zmin, zmax = z_min, z_max
@@ -438,6 +472,7 @@ with tab4:
             # 批量检测所有帧 (subprocess 后台运行, 切 tab 不打断)
             st.subheader("批量检测所有帧")
             if st.button("运行 SECOND 检测全部帧"):
+                log_to_terminal("\n[批量检测] 开始...")
                 model_path = str("/tmp/best_model.pth")
                 out_dir = THIS_DIR / "outputs" / "vis"
 
@@ -459,14 +494,18 @@ with tab4:
                 )
                 for line in proc.stdout:
                     log_text += line
+                    log_to_terminal(line.rstrip())
                     log_box.code(log_text, language="bash", height=400)
                 proc.wait()
 
                 if proc.returncode == 0:
                     status_box.success(f"批量检测完成! 结果已保存到: {out_dir}")
+                    log_to_terminal("[批量检测] 完成")
                     # 列出输出文件
                     files = list(Path(out_dir).glob("*.pcd"))
                     if files:
                         st.write(f"共生成 {len(files)} 个 pcd 文件")
+                        log_to_terminal(f"[批量检测] 生成 {len(files)} 个 pcd 文件")
                 else:
                     status_box.error(f"批量检测失败, 返回码 {proc.returncode}")
+                    log_to_terminal(f"[批量检测] 失败, 返回码 {proc.returncode}")
