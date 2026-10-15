@@ -23,12 +23,8 @@ from utils import (
     setup_logger, load_yaml_config, pointcloud2_to_xyzi, msg_stamp_ns,
     save_T_yaml, save_point_cloud, colorize_by_holes, circle_fit_2d, residual_3d
 )
-from detector import CalibrationBoardDetector
+from detector import CalibrationBoardDetector, SECONDBoardDetector
 from cameras import BaseCamera, FisheyeCamera, PinholeCamera
-try:
-    from second_board_detector import SECONDBoardDetector
-except ImportError:
-    SECONDBoardDetector = None
 
 
 class CompressedVideoDecoder:
@@ -696,7 +692,7 @@ if __name__ == "__main__":
     # SECOND 检测器 (可选)
     board_detector = None
     second_cfg = cfg.get("second_detector", {})
-    if second_cfg.get("enabled", False) and SECONDBoardDetector is not None:
+    if second_cfg.get("enabled", False):
         logging.info(f"loading SECOND detector: {second_cfg['model_path']}")
         board_detector = SECONDBoardDetector(
             second_cfg["model_path"],
