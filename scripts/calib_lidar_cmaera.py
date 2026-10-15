@@ -100,231 +100,293 @@ class FastCalibLidarCamCalibrator:
         self.out_root_result = os.path.join(output_root, "result")
         self.out_root_intermediate = os.path.join(output_root, "intermediate")
         os.makedirs(self.out_root_result, exist_ok=True)
-        os.makedirs(self.out_root_intermediate, exist_ok=True)
-        self.camera = camera
-        self.hole_palette = hole_palette
-        self.aruco_dict = cv2.aruco.getPredefinedDictionary(aruco_dict_id)
-        self.aruco_params = cv2.aruco.DetectorParameters()
         self.board_detector = board_detector
+        self.camera = camera
+        self.hole_palette = hole_palette.copy()
+        self.aruco_det = cv2.aruco.ArucoDetector(
+            cv2.aruco.getPredefinedDictionary(aruco_dict_id),
+            cv2.aruco.DetectorParameters()
+        )
 
-    def _make_cam_dir(self, cam_name: str) -> str:
-        d = os.path.join(self.out_root_intermediate, cam_name)
-        os.makedirs(os.path.join(d, "images"), exist_ok=True)
-        return d
+    def _marker_obj_corners(self):
+        s = self.marker_size / 2.0
+        return np.array([[-s, s, 0.0], [s, s, 0.0], [s, -s, 0.0], [-s, -s, 0.0]], dtype=np.float64)
 
-    def detect_fastcalib_holes_2d(self, img: np.ndarray):
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        corners, ids, _ = cv2.aruco.detectMarkers(gray, self.aruco_dict, parameters=self.aruco_params)
+    def estimate_board_pose(self, corners, ids):
+        local = self._marker_obj_corners()
+        obj_list, img_list = [], []
+        if self.marker_centers_board is not None:
+            for i, mid in enumerate(ids.flatten().tolist()):
+                center = self.marker_centers_board.get(mid)
+                if center is None:
+                    continue
+                obj_list.append(np.asarray(center, dtype=np.float64) + local)
+                img_list.append(corners[i][0].reshape(4, 2))
+        if not obj_list:
+            k = int(np.argmin(ids.flatten()))
+            obj_list, img_list = [local], [corners[k][0].reshape(4, 2)]
+        obj_all = np.vstack(obj_list).reshape(1, -1, 3)
+        img_all = np.vstack(img_list).reshape(1, -1, 2)
+        ok, rvec, tvec = self.camera.estimate_pose(obj_all, img_all)
+        return (rvec, tvec) if ok else (None, None)
+
+    def detect_fastcalib_holes_2d(self, img_bgr):
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = self.aruco_det.detectMarkers(gray)
         if ids is None or len(ids) < 4:
             return None, corners, ids, None, None
-        ids = ids.flatten()
-        idx_map = {int(i): k for k, i in enumerate(ids)}
-        try:
-            m_centers = {}
-            for marker_id in [1, 2, 3, 4]:
-                c = corners[idx_map[marker_id]].reshape(4, 2).mean(axis=0)
-                m_centers[marker_id] = c
-        except KeyError:
+        rvec, tvec = self.estimate_board_pose(corners, ids)
+        if rvec is None:
             return None, corners, ids, None, None
+        R_board, _ = cv2.Rodrigues(rvec)
+        holes_cam = (R_board @ self.hole_centers_board.T).T + tvec.reshape(3)
+        holes_uv = self.camera.project(holes_cam)
+        return holes_uv, corners, ids, R_board, tvec.reshape(3)
 
-        hole_uvs = []
-        for hx, hy in self.hole_centers_board[:, :2]:
-            u = 0.0
-            v = 0.0
-            for marker_id, (mx, my) in self.marker_centers_board.items():
-                w = 1.0 / ((hx - mx) ** 2 + (hy - my) ** 2 + 1e-6)
-                u += w * m_centers[marker_id][0]
-                v += w * m_centers[marker_id][1]
-            w_sum = sum(1.0 / ((hx - mx) ** 2 + (hy - my) ** 2 + 1e-6) for mx, my in self.marker_centers_board.values())
-            hole_uvs.append([u / w_sum, v / w_sum])
-        hole_uvs = np.array(hole_uvs, dtype=np.float64)
-
-        pts2d = np.array([m_centers[i] for i in [1, 2, 3, 4]], dtype=np.float64)
-        pts3d = np.array([self.marker_centers_board[i] for i in [1, 2, 3, 4]], dtype=np.float64)
-        ret, rvec, tvec = cv2.solvePnP(pts3d, pts2d, self.camera.K, self.camera.dist, flags=cv2.SOLVEPNP_P3P)
-        if not ret:
-            return hole_uvs, corners, ids, None, None
-        R_board = cv2.Rodrigues(rvec)[0]
-        return hole_uvs, corners, ids, R_board, tvec
-
-    def detect_hole_centers_lidar(self, pc_roi: np.ndarray):
-        if pc_roi.shape[0] < 300:
-            return None, None
-        # 第一轮 RANSAC: 拟合板子平面
-        plane_eq, inlier_ratio = self._fit_plane_ransac(pc_roi[:, :3])
-        if plane_eq is None:
-            return None, None
-        n = plane_eq[:3]
-        d = plane_eq[3]
-        dist = np.abs(pc_roi[:, 0] * n[0] + pc_roi[:, 1] * n[1] + pc_roi[:, 2] * n[2] + d)
-        inlier_mask = dist < self.plane_tol
-        pc_plane = pc_roi[inlier_mask]
-        ring_inlier = pc_roi[inlier_mask, 4] if pc_roi.shape[1] > 4 else np.arange(len(pc_plane))
-        if pc_plane.shape[0] < 200:
-            return None, None
-
-        # 第二轮 RANSAC: 在平面内找 4 个孔
-        holes3d = []
-        rest = pc_plane[:, :3].copy()
-        rest_ring = ring_inlier.copy()
-        for _ in range(4):
-            if rest.shape[0] < 100:
-                break
-            center, radius, ok = self._fit_hole_ransac(rest)
-            if not ok or radius < self.hole_radius * 0.5 or radius > self.hole_radius * 2.0:
-                break
-            holes3d.append(center)
-            # 删除该孔周围的点
-            r = np.linalg.norm(rest - center, axis=1)
-            keep = r > (radius + 0.05)
-            rest = rest[keep]
-            rest_ring = rest_ring[keep]
-
-        if len(holes3d) < 4:
-            return None, None
-        holes3d = np.array(holes3d, dtype=np.float64)
-
-        # 按板子坐标系排序 (和 hole_centers_board 对应)
-        centroid = holes3d.mean(axis=0)
-        _, eigvecs = np.linalg.eigh(np.cov(holes3d - centroid, rowvar=False))
-        v1 = eigvecs[:, -1]  # 长轴
-        v2 = eigvecs[:, -2]  # 短轴
-        # 保证 z 轴向上
-        z_axis = np.cross(v1, v2)
-        if z_axis[2] < 0:
-            v1 = -v1
-            z_axis = np.cross(v1, v2)
-        # 投影到 2D
-        pts_2d = np.stack([(holes3d - centroid) @ v1, (holes3d - centroid) @ v2], axis=1)
-        # 和标准孔中心做匹配 (最小距离)
-        std_2d = self.hole_centers_board[:, :2].copy()
-        std_cent = std_2d.mean(axis=0)
-        std_2d = std_2d - std_cent
-        # 尝试 4 种旋转 (0, 90, 180, 270) 找最佳匹配
-        best_err = 1e9
-        best_pts = holes3d.copy()
-        for rot_k in range(4):
-            cos_r = np.cos(rot_k * np.pi / 2)
-            sin_r = np.sin(rot_k * np.pi / 2)
-            rot_mat = np.array([[cos_r, -sin_r], [sin_r, cos_r]])
-            pts_2d_rot = pts_2d @ rot_mat.T
-            # 排序匹配
-            err = 0.0
-            for i in range(4):
-                d = np.linalg.norm(pts_2d_rot - std_2d[i], axis=1)
-                err += d.min()
-            if err < best_err:
-                best_err = err
-                # 找到每个标准孔对应的最近点
-                matched = np.zeros(4, dtype=int)
-                used = set()
-                for i in range(4):
-                    d = np.linalg.norm(pts_2d_rot - std_2d[i], axis=1)
-                    sorted_idx = np.argsort(d)
-                    for j in sorted_idx:
-                        if j not in used:
-                            matched[i] = j
-                            used.add(j)
-                            break
-                best_pts = holes3d[matched]
-        return best_pts, plane_eq
-
-    def _fit_plane_ransac(self, pts: np.ndarray):
-        if pts.shape[0] < 10:
-            return None, 0.0
-        best_eq = None
-        best_inlier = 0
-        for _ in range(self.plane_iters):
-            idx = np.random.choice(pts.shape[0], 3, replace=False)
-            p1, p2, p3 = pts[idx]
-            v1 = p2 - p1
-            v2 = p3 - p1
-            n = np.cross(v1, v2)
-            norm = np.linalg.norm(n)
-            if norm < 1e-6:
+    def _ring_edge_points(self, pc, plane_model):
+        a, b, c, d = plane_model[:4]
+        nn = np.sqrt(a * a + b * b + c * c)
+        dist = np.abs(pc[:, 0] * a + pc[:, 1] * b + pc[:, 2] * c + d) / nn
+        ring = pc[:, 4] if pc.shape[1] >= 5 else np.zeros(len(pc))
+        edges = []
+        for r in np.unique(ring):
+            idx = np.where(ring == r)[0]
+            if len(idx) < 10:
                 continue
-            n = n / norm
-            d = -n @ p1
-            dist = np.abs(pts @ n + d)
-            inlier = np.sum(dist < self.plane_tol)
-            if inlier > best_inlier:
-                best_inlier = inlier
-                best_eq = np.array([n[0], n[1], n[2], d])
-        return best_eq, best_inlier / pts.shape[0] if pts.shape[0] > 0 else 0.0
+            pts = pc[idx, :3]
+            on_plane = dist[idx] < 0.03
+            dp = np.linalg.norm(pts - np.roll(pts, 1, axis=0), axis=1)
+            dn = np.linalg.norm(pts - np.roll(pts, -1, axis=0), axis=1)
+            m = on_plane & ((dp > 0.10) | (dn > 0.10))
+            m[0] = m[-1] = False
+            if m.any():
+                edges.append(pts[m])
+        return np.vstack(edges) if edges else np.zeros((0, 3))
 
-    def _fit_hole_ransac(self, pts: np.ndarray):
-        if pts.shape[0] < 10:
-            return None, None, False
-        best_center = None
-        best_radius = None
-        best_inlier = 0
-        for _ in range(100):
-            idx = np.random.choice(pts.shape[0], 3, replace=False)
-            p1, p2, p3 = pts[idx]
-            center, radius = circle_fit_2d(np.stack([p1[:2], p2[:2], p3[:2]]))
-            r = np.linalg.norm(pts[:, :2] - center, axis=1)
-            inlier = np.sum(np.abs(r - radius) < 0.02)
-            if inlier > best_inlier:
-                best_inlier = inlier
-                best_center = np.array([center[0], center[1], pts[:, 2].mean()])
-                best_radius = radius
-        if best_inlier < 20:
-            return None, None, False
-        return best_center, best_radius, True
+    def _square_valid(self, cents4, tol=0.1):
+        d = np.sort(pdist(cents4))
+        diag = np.hypot(self.delta_width, self.delta_height)
+        e = np.sort([self.delta_height, self.delta_height, self.delta_width,
+                     self.delta_width, diag, diag])
+        return bool(np.all(np.abs(d - e) <= tol * e))
 
-    def calibrate_single_cam(self, lidar_3d_list, img_2d_list, board_poses, edge_frames=None):
-        pts_3d = []
-        pts_2d = []
-        for h3d, h2d in zip(lidar_3d_list, img_2d_list):
-            pts_3d.append(h3d)
-            pts_2d.append(h2d)
-        pts_3d = np.vstack(pts_3d)
-        pts_2d = np.vstack(pts_2d)
+    def detect_hole_centers_lidar(self, pc_roi, max_planes=8):
+        xyz = pc_roi[:, :3]
+        ring = pc_roi[:, 4] if pc_roi.shape[1] >= 5 else np.zeros(len(pc_roi))
+        rest, rest_ring = xyz, ring.copy()
+        plane_pts = xyz[:0]
+        for _ in range(max_planes):
+            if rest.shape[0] < 200:
+                break
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(rest.astype(np.float64))
+            model, idx = pcd.segment_plane(distance_threshold=self.plane_tol,
+                                           ransac_n=3, num_iterations=self.plane_iters)
+            idx = np.asarray(idx)
+            patch = rest[idx]
+            patch_ring = rest_ring[idx]
+            rest = np.delete(rest, idx, axis=0)
+            rest_ring = np.delete(rest_ring, idx, axis=0)
+            if patch.shape[0] < 200:
+                continue
+            if self.board_vertical_prior and abs(model[2]) > 0.5:
+                continue
+            plane_pts = patch
+            edges = self._ring_edge_points(pc_roi, model)
+            if len(edges) < 8:
+                continue
+            n = model[:3] / np.linalg.norm(model[:3])
+            axis = np.cross(n, np.array([0.0, 0.0, 1.0]))
+            s = np.linalg.norm(axis)
+            if s < 1e-8:
+                R_align = np.eye(3)
+            else:
+                angle = np.arccos(np.clip(n[2], -1.0, 1.0))
+                rot_vec = (axis / s) * angle
+                R_align = Rotation.from_rotvec(rot_vec).as_matrix()
+            al_edge = (R_align @ edges.T).T
+            al_patch = (R_align @ patch.T).T
+            avg_z = float(al_edge[:, 2].mean())
+            exy, pxy = al_edge[:, :2], al_patch[:, :2]
+            plane_ring = patch_ring
+            gaps = []
+            if len(plane_ring) == len(pxy):
+                for r in np.unique(plane_ring):
+                    msk = plane_ring == r
+                    if msk.sum() < 8:
+                        continue
+                    pp = pxy[msk]
+                    w = np.linalg.eigh(np.cov((pp - pp.mean(axis=0)).T))[1][:, 1]
+                    p_s = pp[np.argsort(pp @ w)]
+                    d = np.linalg.norm(np.diff(p_s, axis=0), axis=1)
+                    gaps += [0.5 * (p_s[j] + p_s[j + 1]) for j in np.where((d > 0.15) & (d < 0.35))[0]]
+            if len(gaps) < 4:
+                continue
+            clusters = []
+            for g in gaps:
+                g2 = g[:2]
+                for cl in clusters:
+                    if np.linalg.norm(np.mean(cl, axis=0) - g2) < 0.09:
+                        cl.append(g2)
+                        break
+                else:
+                    clusters.append([g2])
+            coarse = [np.mean(cl, axis=0) for cl in clusters if len(cl) >= 2]
+            if len(coarse) < 4:
+                continue
+            centers = []
+            for c0 in np.array(coarse)[:, :2]:
+                rim = exy[np.abs(np.linalg.norm(exy - c0, axis=1) - self.hole_radius) < 0.03]
+                if len(rim) >= 6:
+                    cen, rr = circle_fit_2d(rim)
+                    if abs(rr - self.hole_radius) <= 0.03 and np.linalg.norm(cen - c0) < 0.08:
+                        c0 = cen
+                centers.append(c0)
+            if len(centers) < 4:
+                continue
+            centers = np.array(centers)
+            valid = [c4 for c4 in combinations(range(len(centers)), 4) if self._square_valid(centers[list(c4)])]
+            if not valid:
+                continue
+            if len(valid) > 1:
+                logging.warning(f"{len(valid)}组圆心满足矩形几何，取第一组")
+            c4 = centers[list(valid[0])]
+            cents = (R_align.T @ np.column_stack([c4[:, 0], c4[:, 1], np.full(len(c4), avg_z)]).T).T
+            return cents, patch
+        return None, plane_pts
 
-        # 初始值: 用 solvePnP 估计
-        ret, rvec_init, tvec_init = cv2.solvePnP(
-            pts_3d.astype(np.float64), pts_2d.astype(np.float64),
-            self.camera.K, self.camera.dist, flags=cv2.SOLVEPNP_ITERATIVE
-        )
-        if not ret:
-            rvec_init = np.zeros(3)
-            tvec_init = np.array([0.0, 0.0, 2.0])
+    def _board_frame_from_centers(self, cents, su):
+        m = cents.mean(axis=0)
+        ev = np.linalg.eigh(np.cov((cents - m).T))[1]
+        u0, n0 = ev[:, 2], ev[:, 0]
+        p = 1.0 if (n0 @ m) < 0 else -1.0
+        u, n = su * u0, p * n0
+        v = np.cross(n, u)
+        R_bl = np.stack([u, v, n])
+        bc = (R_bl @ (cents - m).T).T
+        pi = [int(np.argmin(np.linalg.norm(self.hole_centers_board - q, axis=1))) for q in bc]
+        if len(set(pi)) != 4 or max(np.min(np.linalg.norm(self.hole_centers_board - q, axis=1)) for q in bc) > 0.1:
+            return None, None
+        B_l = np.eye(4)
+        B_l[:3, :3] = R_bl
+        B_l[:3, 3] = -R_bl @ m
+        return B_l, pi
 
-        # LM 优化
-        x0 = np.concatenate([rvec_init.flatten(), tvec_init.flatten()])
-        result = least_squares(
-            residual_3d, x0, args=(pts_3d, pts_2d),
-            method="lm", max_nfev=2000,
-        )
-        R_opt = Rotation.from_rotvec(result.x[:3]).as_matrix()
-        t_opt = result.x[3:6]
-        T_opt = np.eye(4)
-        T_opt[:3, :3] = R_opt
-        T_opt[:3, 3] = t_opt
+    def _edge_score_maps(self, ed, pc, T):
+        if len(pc) == 0:
+            return 0.0
+        pc_cam = (T[:3, :3] @ pc[:, :3].T).T + T[:3, 3]
+        pc_cam = pc_cam[pc_cam[:, 2] > 0.2]
+        uv = self.camera.project(pc_cam).astype(int)
+        h, w = ed.shape
+        m = (uv[:, 0] >= 0) & (uv[:, 0] < w - 1) & (uv[:, 1] >= 0) & (uv[:, 1] < h - 1)
+        uv = uv[m]
+        return float(ed[uv[:, 1], uv[:, 0]].sum()) / 255.0 / len(pc) if len(uv) else 0.0
 
-        # 计算重投影误差
-        pts_2d_proj = self.camera.project(T_opt, pts_3d)
-        err = np.linalg.norm(pts_2d_proj - pts_2d, axis=1)
-        mean_err = float(err.mean())
-        return T_opt, mean_err, result
+    def calibrate_single_cam(self, lidar_list, img_list, board_poses, edge_frames=None):
+        H = self.hole_centers_board
+        branches = []
+        for su in (1, -1):
+            Ls, Cs, Tfs, used, vz = [], [], [], [], []
+            for j, (cents, (Rb, tb)) in enumerate(zip(lidar_list, board_poses)):
+                B_l, pi = self._board_frame_from_centers(cents, su)
+                if B_l is None:
+                    continue
+                B_c = np.eye(4)
+                B_c[:3, :3], B_c[:3, 3] = Rb, tb
+                Tfs.append(B_c @ np.linalg.inv(B_l))
+                Ls.append(cents[np.argsort(pi)])
+                Cs.append((B_c[:3, :3] @ H.T).T + B_c[:3, 3])
+                used.append(j)
+                vz.append(B_l[:3, :3][1, 2])
+            if len(Ls) < 3:
+                continue
+            vz_mean = float(np.mean(vz))
+            L, C = np.vstack(Ls), np.vstack(Cs)
+            M = np.mean(Tfs, axis=0)
+            U, _, Vt = np.linalg.svd(M[:3, :3])
+            R0 = U @ Vt
+            if np.linalg.det(R0) < 0:
+                U[:, -1] *= -1
+                R0 = U @ Vt
+            x0 = np.hstack([Rotation.from_matrix(R0).as_rotvec(), M[:3, 3]])
+            res = least_squares(residual_3d, x0, args=(L, C), method="trf", loss="huber", f_scale=0.03)
+            Rf = Rotation.from_rotvec(res.x[:3]).as_matrix()
+            tf = res.x[3:6]
+            fr = np.array([np.median(np.linalg.norm((Rf @ Ls[f].T).T + tf - Cs[f], axis=1)) for f in range(len(Ls))])
+            keep_f = [f for f in range(len(Ls)) if fr[f] <= max(0.05, 3 * np.median(fr))]
+            if 3 <= len(keep_f) < len(Ls):
+                L, C = np.vstack([Ls[f] for f in keep_f]), np.vstack([Cs[f] for f in keep_f])
+                used = [used[f] for f in keep_f]
+                x0 = np.hstack([Rotation.from_matrix(Rf).as_rotvec(), tf])
+                res = least_squares(residual_3d, x0, args=(L, C), method="trf", loss="huber", f_scale=0.03)
+            T_i = np.eye(4)
+            T_i[:3, :3] = Rotation.from_rotvec(res.x[:3]).as_matrix()
+            T_i[:3, 3] = res.x[3:6]
+            err3d = float(np.median(np.linalg.norm((T_i[:3, :3] @ L.T).T + T_i[:3, 3] - C, axis=1)))
+            branches.append((err3d, T_i, Tfs[0], used, vz_mean))
+        if not branches:
+            raise RuntimeError("no valid board‑registration branch")
+        up = [b for b in branches if b[4] > 0.15]
+        if len(up) == 1:
+            k = branches.index(up[0])
+            logging.info(f"branches={len(branches)} upright‑prior vz={[round(b[4],2) for b in branches]} -> pick {k}")
+        else:
+            per = [[self._edge_score_maps(ed, pc, T_i) for ed, pc in edge_frames] for _, T_i, _, _, _ in branches] if edge_frames else [[b[0]] for b in branches]
+            scores = [float(np.mean(pp)) for pp in per]
+            k = int(np.argmax(scores))
+            logging.info(f"branches={len(branches)} edge‑align={[round(s,3) for s in scores]} -> pick {k}")
+        err3d, T_opt, T_init, used, _ = branches[k]
+        reps = []
+        for j in used:
+            pc_cam = (T_opt[:3, :3] @ lidar_list[j].T).T + T_opt[:3, 3]
+            uv = self.camera.project(pc_cam)
+            cost = np.linalg.norm(uv[:, None, :] - np.asarray(img_list[j])[None, :, :], axis=-1)
+            reps.append(cost.min(axis=1).mean())
+        logging.info(f"3D‑3D median residual: {err3d*100:.2f} cm ({len(used)} frames used)")
+        return T_opt, float(np.mean(reps)), T_init
+
+    def _draw_projection(self, img, pc, T, out_path):
+        pc_cam = (T[:3, :3] @ pc[:, :3].T).T + T[:3, 3]
+        pc_cam = pc_cam[pc_cam[:, 2] > 0.2]
+        if len(pc_cam) == 0:
+            return
+        uv = self.camera.project(pc_cam).astype(int)
+        h, w = img.shape[:2]
+        m = (uv[:, 0] >= 0) & (uv[:, 0] < w - 1) & (uv[:, 1] >= 0) & (uv[:, 1] < h - 1)
+        uv, d = uv[m].astype(int), pc_cam[m, 2]
+        denom = max(1e-6, d.max() - d.min())
+        dn = ((d - d.min()) / denom * 255).astype(np.uint8)
+        cmap = cv2.applyColorMap(dn.reshape(-1, 1, 1), cv2.COLORMAP_JET).reshape(-1, 3)
+        draw = img.copy()
+        step = max(1, len(uv) // 40000)
+        for q, col in zip(uv[::step], cmap[::step]):
+            cv2.circle(draw, (int(q[0]), int(q[1])), 1, (int(col[0]), int(col[1]), int(col[2])), -1)
+        cv2.imwrite(out_path, draw)
 
     def _read_lidar_msgs(self, mcap_path, lidar_topic, point_field_datatype_to_np):
-        lidar_msgs = []
+        out = []
         with open(mcap_path, "rb") as f:
             reader = make_reader(f, decoder_factories=[DecoderFactory()])
-            for schema, channel, msg, ros_msg in reader.iter_decoded_messages(topics=[lidar_topic]):
-                t_ns = msg_stamp_ns(ros_msg, msg)
-                pc = pointcloud2_to_xyzi(ros_msg, point_field_datatype_to_np)
-                lidar_msgs.append((t_ns, pc))
-        logging.info(f"lidar frames count = {len(lidar_msgs)}")
-        return lidar_msgs
+            for _, chan, msg, ros_msg in reader.iter_decoded_messages(topics=[lidar_topic]):
+                if type(ros_msg).__name__ != "PointCloud2":
+                    continue
+                try:
+                    ts = msg_stamp_ns(ros_msg, msg)
+                    pc = pointcloud2_to_xyzi(ros_msg, point_field_datatype_to_np)
+                    out.append((ts, pc))
+                except Exception as e:
+                    logging.error(f"lidar parse err:{e}")
+        out.sort(key=lambda x: x[0])
+        logging.info(f"lidar_msgs count = {len(out)}")
+        return out
 
-    def _iter_image_frames(self, mcap_path, img_topic, format_map):
+    def _iter_image_frames(self, mcap_path, img_topic, format_map: dict):
         video_dec = None
         n_img = 0
         with open(mcap_path, "rb") as f:
             reader = make_reader(f, decoder_factories=[DecoderFactory()])
-            for schema, channel, msg, ros_msg in reader.iter_decoded_messages(topics=[img_topic]):
+            for _, chan, msg, ros_msg in reader.iter_decoded_messages(topics=[img_topic]):
                 t_ns = msg_stamp_ns(ros_msg, msg)
                 name = type(ros_msg).__name__
                 # 兼容 foxglove_msgs/msg/CompressedVideo 等带前缀的消息类型
@@ -526,42 +588,55 @@ class FastCalibLidarCamCalibrator:
                     imgd = cv2.imread(os.path.join(cam_out_dir, "images", f"frame_{fi:04d}.jpg"))
                     if imgd is None:
                         continue
-                    pts_2d_proj = self.camera.project(T_opt, h3)
-                    for uv in pts_2d_proj:
-                        cv2.circle(imgd, (int(uv[0]), int(uv[1])), 5, (0, 255, 0), -1)
-                    cv2.imwrite(os.path.join(cam_out_dir, "overlays", f"frame_{fi:04d}.jpg"), imgd)
-            out_result[cam_name] = T_opt
+                    pc_cam = (T_opt[:3, :3] @ h3.T).T + T_opt[:3, 3]
+                    uv = self.camera.project(pc_cam)
+                    for q in uv:
+                        p1 = (int(q[0]), int(q[1]))
+                        j = int(np.argmin(np.linalg.norm(h2 - q, axis=1)))
+                        p2 = (int(h2[j][0]), int(h2[j][1]))
+                        cv2.circle(imgd, p1, 10, (0, 255, 0), 2)
+                        cv2.line(imgd, p1, p2, (0, 255, 0), 1)
+                    cv2.imwrite(os.path.join(cam_out_dir, "reproj", f"frame_{fi:04d}_reproj.jpg"), imgd)
+                for fi, imgv, pcv in viz_frames:
+                    self._draw_projection(imgv, pcv, T_opt, os.path.join(cam_out_dir, "proj", f"frame_{fi:04d}_proj.jpg"))
+            logging.info(f"saved overlays: {len(valid_frames)} reproj + {len(viz_frames)} proj")
+            out_result[cam_name] = {"T_lidar2cam": T_opt, "mean_reproj_err": mean_err}
         return out_result
 
-    def visualize_with_T(self, mcap_path, img_topic, lidar_topic, pc_roi_lim, T, frame_idx, point_field_datatype_to_np, format_map, out_dir=None):
-        if out_dir is None:
-            out_dir = os.path.join(self.out_root_intermediate, "vis_overlays")
+    def _make_cam_dir(self, cam_name: str):
+        cam_dir = os.path.join(self.out_root_intermediate, cam_name)
+        os.makedirs(os.path.join(cam_dir, "images"), exist_ok=True)
+        os.makedirs(os.path.join(cam_dir, "proj"), exist_ok=True)
+        os.makedirs(os.path.join(cam_dir, "reproj"), exist_ok=True)
+        os.makedirs(os.path.join(cam_dir, "pointcloud"), exist_ok=True)
+        os.makedirs(os.path.join(cam_dir, "roi_pointcloud"), exist_ok=True)
+        return cam_dir
+
+    def visualize_with_T(self, mcap_path, img_topic, lidar_topic, pc_roi_lim, T, frame_idx, point_field_datatype_to_np, format_map, out_dir):
         os.makedirs(out_dir, exist_ok=True)
-        manual_xlim, manual_ylim, manual_zlim = pc_roi_lim
-        for i, (img, pc) in enumerate(self.read_mcap_sync(mcap_path, img_topic, lidar_topic, point_field_datatype_to_np, format_map, max_frames=frame_idx + 1)):
+        xlim, ylim, zlim = pc_roi_lim
+        for i, (img, pc) in enumerate(self.read_mcap_sync(mcap_path, img_topic, lidar_topic, point_field_datatype_to_np, format_map)):
             if i != frame_idx:
                 continue
-            xlim, ylim, zlim = manual_xlim, manual_ylim, manual_zlim
-            if self.board_detector is not None:
-                detect_ok, auto_roi = self.board_detector.detect(pc)
-                if detect_ok and auto_roi is not None:
-                    xlim, ylim, zlim = auto_roi
-            roi_mask = ((pc[:, 0] >= xlim[0]) & (pc[:, 0] <= xlim[1])
-                        & (pc[:, 1] >= ylim[0]) & (pc[:, 1] <= ylim[1])
-                        & (pc[:, 2] >= zlim[0]) & (pc[:, 2] <= zlim[1]))
-            pc_roi = pc[roi_mask]
-            holes3d, _ = self.detect_hole_centers_lidar(pc_roi)
-            img_draw = img.copy()
-            if holes3d is not None and len(holes3d) == 4:
-                pts_2d_proj = self.camera.project(T, holes3d)
-                for uv in pts_2d_proj:
-                    cv2.circle(img_draw, (int(uv[0]), int(uv[1])), 5, (0, 255, 0), -1)
-            out_path = os.path.join(out_dir, f"vis_frame_{frame_idx:04d}.jpg")
-            cv2.imwrite(out_path, img_draw)
-            logging.info(f"saved {out_path}")
+            out = os.path.join(out_dir, f"proj_T_frame{i:04d}.jpg")
+            self._draw_projection(img, pc, T, out)
+            logging.info(f"saved {out}")
+            h2d, _, _, _, _ = self.detect_fastcalib_holes_2d(img)
+            roi = pc[(pc[:, 0] >= xlim[0]) & (pc[:, 0] <= xlim[1])
+                     & (pc[:, 1] >= ylim[0]) & (pc[:, 1] <= ylim[1])
+                     & (pc[:, 2] >= zlim[0]) & (pc[:, 2] <= zlim[1])]
+            cents, _ = self.detect_hole_centers_lidar(roi)
+            if h2d is not None and cents is not None and len(cents) == 4:
+                pc_cam = (T[:3, :3] @ cents.T).T + T[:3, 3]
+                uv = self.camera.project(pc_cam)
+                cost = np.linalg.norm(uv[:, None] - h2d[None, :], axis=-1)
+                logging.info(f"frame {i}: hole reproj err = {cost.min(axis=1).round(1)} px")
+            return
+        logging.warning(f"frame {frame_idx} not found")
 
 
 def load_T(path):
+    meta = {}
     if path.endswith(".npy"):
         T = np.load(path)
         yaml_path = path.replace(".npy", ".yaml")
@@ -569,23 +644,18 @@ def load_T(path):
             import yaml
             with open(yaml_path, "r", encoding="utf-8") as f:
                 meta = yaml.safe_load(f)
-            return T, meta
-        return T, {}
-    elif path.endswith(".yaml"):
+    else:
         import yaml
         with open(path, "r", encoding="utf-8") as f:
             d = yaml.safe_load(f)
-        R = np.array(d["Rcl"]).reshape(3, 3)
-        t = np.array(d["Pcl"])
         T = np.eye(4)
-        T[:3, :3] = R
-        T[:3, 3] = t
-        return T, d
-    else:
-        raise ValueError(f"unsupported file type: {path}")
+        T[:3, :3] = np.array(d["Rcl"], dtype=np.float64).reshape(3, 3)
+        T[:3, 3] = np.array(d["Pcl"], dtype=np.float64).reshape(3)
+        meta = d
+    return T, meta
 
 
-def main():
+if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--vis", default=None, help="外参npy/yaml路径，质检投影")
     ap.add_argument("--frame", type=int, default=0)
@@ -682,7 +752,3 @@ def main():
             format_map=format_map
         )
     logging.info("\n===== Calibration done =====")
-
-
-if __name__ == "__main__":
-    main()
