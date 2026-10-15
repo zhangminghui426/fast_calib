@@ -407,58 +407,33 @@ with tab4:
                     o3d.io.write_point_cloud(pcd_path, pcd)
                     st.info(f"已保存: {pcd_path}")
 
-            # 批量检测所有帧
+            # 批量检测所有帧 (subprocess 后台运行, 切 tab 不打断)
             st.subheader("批量检测所有帧")
             if st.button("运行 SECOND 检测全部帧"):
-                import open3d as o3d
-                sys.path.insert(0, str(SCRIPTS_DIR))
-                from second_board_detector import SECONDBoardDetector
-
                 model_path = str("/tmp/best_model.pth")
-                detector = SECONDBoardDetector(model_path=model_path, score_thr=second_score_thr)
+                out_dir = THIS_DIR / "outputs" / "vis"
 
-                vis_dir = THIS_DIR / "outputs" / "vis"
-                vis_dir.mkdir(parents=True, exist_ok=True)
-
-                ok_count = 0
-                fail_count = 0
-                progress_bar = st.progress(0)
+                st.subheader("批量检测日志")
+                log_box = st.empty()
                 log_text = ""
+                st.info("批量检测运行中... 切换 tab 不会打断")
 
-                with open(mcap_file, "rb") as f:
-                    reader = make_reader(f, decoder_factories=[DecoderFactory()])
-                    for i, (schema, channel, msg, ros_msg) in enumerate(
-                        reader.iter_decoded_messages(topics=[lidar_topic])
-                    ):
-                        pts = np.frombuffer(ros_msg.data, dtype=np.float32).reshape(-1, ros_msg.point_step // 4)
-                        valid_mask = np.isfinite(pts[:, :3]).all(axis=1)
-                        pts = pts[valid_mask]
+                proc = subprocess.Popen(
+                    [sys.executable, str(THIS_DIR / "tools" / "batch_detect.py"),
+                     "--mcap", mcap_file,
+                     "--model", model_path,
+                     "--score", str(second_score_thr),
+                     "--lidar-topic", lidar_topic,
+                     "--out-dir", str(out_dir)],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, cwd=str(THIS_DIR), bufsize=1,
+                )
+                for line in proc.stdout:
+                    log_text += line
+                    log_box.code(log_text, language="bash")
+                proc.wait()
 
-                        ok, roi = detector.detect(pts)
-                        if ok and roi is not None:
-                            (xmin, xmax), (ymin, ymax), (zmin, zmax) = roi
-                            ok_count += 1
-                            log_text += f"frame {i}: OK  ROI=[{xmin:.2f},{xmax:.2f}] [{ymin:.2f},{ymax:.2f}] [{zmin:.2f},{zmax:.2f}]\n"
-
-                            # 保存带颜色 pcd
-                            roi_mask = (
-                                (pts[:, 0] >= xmin) & (pts[:, 0] <= xmax)
-                                & (pts[:, 1] >= ymin) & (pts[:, 1] <= ymax)
-                                & (pts[:, 2] >= zmin) & (pts[:, 2] <= zmax)
-                            )
-                            pcd = o3d.geometry.PointCloud()
-                            pcd.points = o3d.utility.Vector3dVector(pts[:, :3])
-                            colors = np.zeros((len(pts), 3))
-                            colors[~roi_mask] = [0.5, 0.5, 0.5]
-                            colors[roi_mask] = [0, 1, 0]
-                            pcd.colors = o3d.utility.Vector3dVector(colors)
-                            o3d.io.write_point_cloud(str(vis_dir / f"batch_frame_{i:04d}.pcd"), pcd)
-                        else:
-                            fail_count += 1
-                            log_text += f"frame {i}: FAIL\n"
-
-                        progress_bar.progress((i + 1) / total_frames)
-
-                st.success(f"检测完成: 成功 {ok_count} 帧, 失败 {fail_count} 帧")
-                st.code(log_text, language="bash")
-                st.info(f"带颜色 pcd 已保存到: {vis_dir}")
+                if proc.returncode == 0:
+                    st.success(f"批量检测完成! 结果已保存到: {out_dir}")
+                else:
+                    st.error(f"批量检测失败, 返回码 {proc.returncode}")
