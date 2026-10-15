@@ -176,7 +176,8 @@ output_dir: "{THIS_DIR / 'outputs'}"
         st.subheader("运行日志")
         log_box = st.empty()
         log_text = ""
-        st.info("标定运行中...")
+        status_box = st.empty()
+        status_box.info("标定运行中...")
 
         proc = subprocess.Popen(
             [sys.executable, str(SCRIPTS_DIR / "calib_lidar_cmaera.py"),
@@ -194,7 +195,7 @@ output_dir: "{THIS_DIR / 'outputs'}"
         result_dir = output_root / "result"
 
         if proc.returncode == 0:
-            st.success("标定完成!")
+            status_box.success(f"标定完成! (返回码 {proc.returncode})")
             # 自动列出结果文件
             st.subheader("生成的产物")
             if result_dir.exists():
@@ -203,11 +204,11 @@ output_dir: "{THIS_DIR / 'outputs'}"
                     for f in sorted(files):
                         st.write(f"  - `{f.name}`  ({f.stat().st_size / 1024:.1f} KB)")
                 else:
-                    st.warning(f"result 目录存在但为空: {result_dir}")
+                    status_box.warning(f"result 目录存在但为空，可能有效样本数不足")
             else:
-                st.error(f"result 目录不存在: {result_dir}")
+                status_box.error(f"result 目录不存在: {result_dir}")
         else:
-            st.error(f"标定失败, 返回码 {proc.returncode}")
+            status_box.error(f"标定失败, 返回码 {proc.returncode}")
             st.error("请查看上方日志的错误信息")
 
 with tab2:
@@ -219,6 +220,8 @@ with tab2:
     if st.button("运行投影可视化"):
         log_box = st.empty()
         log_text = ""
+        status_box = st.empty()
+        status_box.info("可视化运行中...")
         proc = subprocess.Popen(
             [sys.executable, str(SCRIPTS_DIR / "calib_lidar_cmaera.py"),
              "--vis", vis_T, "--frame", str(vis_frame),
@@ -231,9 +234,9 @@ with tab2:
             log_box.code(log_text, language="bash", height=400)
         proc.wait()
         if proc.returncode == 0:
-            st.success("可视化完成!")
+            status_box.success("可视化完成!")
         else:
-            st.error(f"可视化失败, 返回码 {proc.returncode}")
+            status_box.error(f"可视化失败, 返回码 {proc.returncode}")
 
 with tab3:
     st.header("标定结果")
@@ -441,7 +444,8 @@ with tab4:
                 st.subheader("批量检测日志")
                 log_box = st.empty()
                 log_text = ""
-                st.info("批量检测运行中... 切换 tab 不会打断")
+                status_box = st.empty()
+                status_box.info("批量检测运行中... 切换 tab 不会打断")
 
                 proc = subprocess.Popen(
                     [sys.executable, str(THIS_DIR / "tools" / "batch_detect.py"),
@@ -459,10 +463,10 @@ with tab4:
                 proc.wait()
 
                 if proc.returncode == 0:
-                    st.success(f"批量检测完成! 结果已保存到: {out_dir}")
+                    status_box.success(f"批量检测完成! 结果已保存到: {out_dir}")
                     # 列出输出文件
                     files = list(Path(out_dir).glob("*.pcd"))
                     if files:
                         st.write(f"共生成 {len(files)} 个 pcd 文件")
                 else:
-                    st.error(f"批量检测失败, 返回码 {proc.returncode}")
+                    status_box.error(f"批量检测失败, 返回码 {proc.returncode}")
