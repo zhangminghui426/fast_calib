@@ -171,7 +171,9 @@ class FastCalibLidarCamCalibrator:
 
     def detect_hole_centers_lidar(self, pc_roi, max_planes=8):
         xyz = pc_roi[:, :3]
-        rest, plane_pts = xyz, xyz[:0]
+        ring = pc_roi[:, 4] if pc_roi.shape[1] >= 5 else np.zeros(len(pc_roi))
+        rest, rest_ring = xyz, ring.copy()
+        plane_pts = xyz[:0]
         for _ in range(max_planes):
             if rest.shape[0] < 200:
                 break
@@ -181,7 +183,9 @@ class FastCalibLidarCamCalibrator:
                                            ransac_n=3, num_iterations=self.plane_iters)
             idx = np.asarray(idx)
             patch = rest[idx]
+            patch_ring = rest_ring[idx]
             rest = np.delete(rest, idx, axis=0)
+            rest_ring = np.delete(rest_ring, idx, axis=0)
             if patch.shape[0] < 200:
                 continue
             if self.board_vertical_prior and abs(model[2]) > 0.5:
@@ -200,17 +204,17 @@ class FastCalibLidarCamCalibrator:
                 rot_vec = (axis / s) * angle
                 R_align = Rotation.from_rotvec(rot_vec).as_matrix()
             al_edge = (R_align @ edges.T).T
+            al_patch = (R_align @ patch.T).T
             avg_z = float(al_edge[:, 2].mean())
-            exy = al_edge[:, :2]
-            ring = pc_roi[:, 4] if pc_roi.shape[1] >= 5 else None
-            plane_ring = ring[idx] if ring is not None else None
+            exy, pxy = al_edge[:, :2], al_patch[:, :2]
+            plane_ring = patch_ring
             gaps = []
-            if plane_ring is not None:
+            if len(plane_ring) == len(pxy):
                 for r in np.unique(plane_ring):
                     msk = plane_ring == r
                     if msk.sum() < 8:
                         continue
-                    pp = patch[msk]
+                    pp = pxy[msk]
                     w = np.linalg.eigh(np.cov((pp - pp.mean(axis=0)).T))[1][:, 1]
                     p_s = pp[np.argsort(pp @ w)]
                     d = np.linalg.norm(np.diff(p_s, axis=0), axis=1)
@@ -219,17 +223,18 @@ class FastCalibLidarCamCalibrator:
                 continue
             clusters = []
             for g in gaps:
+                g2 = g[:2]
                 for cl in clusters:
-                    if np.linalg.norm(np.mean(cl, axis=0) - g) < 0.09:
-                        cl.append(g)
+                    if np.linalg.norm(np.mean(cl, axis=0) - g2) < 0.09:
+                        cl.append(g2)
                         break
                 else:
-                    clusters.append([g])
+                    clusters.append([g2])
             coarse = [np.mean(cl, axis=0) for cl in clusters if len(cl) >= 2]
             if len(coarse) < 4:
                 continue
             centers = []
-            for c0 in np.array(coarse):
+            for c0 in np.array(coarse)[:, :2]:
                 rim = exy[np.abs(np.linalg.norm(exy - c0, axis=1) - self.hole_radius) < 0.03]
                 if len(rim) >= 6:
                     cen, rr = circle_fit_2d(rim)
